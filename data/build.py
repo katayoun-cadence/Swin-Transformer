@@ -40,6 +40,19 @@ try:
 except:
     from timm.data.transforms import _pil_interp
 
+def build_loader_val(config):
+    dataset_val, _ = build_dataset(is_train=False, config=config)
+    sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, sampler=sampler_val,
+        batch_size=config.DATA.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.DATA.NUM_WORKERS,
+        pin_memory=config.DATA.PIN_MEMORY,
+        drop_last=False
+    )
+    return data_loader_val
 
 def build_loader(config):
     config.defrost()

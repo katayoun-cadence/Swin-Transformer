@@ -12,6 +12,7 @@ import random
 import argparse
 import datetime
 import numpy as np
+import platform
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -22,7 +23,7 @@ from timm.utils import accuracy, AverageMeter
 
 from config import get_config
 from models import build_model
-from data import build_loader
+from data import build_loader, build_loader_val
 from lr_scheduler import build_scheduler
 from optimizer import build_optimizer
 from logger import create_logger
@@ -61,10 +62,11 @@ def parse_option():
                         help='root of output folder, the full path is <output>/<model_name>/<tag> (default: output)')
     parser.add_argument('--tag', help='tag of experiment')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
+    parser.add_argument('--nodist', action='store_true', help='Deactivate distrubited run. Only for model inference')
     parser.add_argument('--throughput', action='store_true', help='Test throughput only')
 
     # distributed training
-    parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
+    parser.add_argument("--local_rank", type=int, required=False, help='local rank for DistributedDataParallel')
 
     # for acceleration
     parser.add_argument('--fused_window_process', action='store_true',
@@ -73,8 +75,11 @@ def parse_option():
     ## overwrite optimizer in config (*.yaml) if specified, e.g., fused_adam/fused_lamb
     parser.add_argument('--optim', type=str,
                         help='overwrite optimizer if provided, can be adamw/sgd/fused_adam/fused_lamb.')
+    parser.add_argument('--save_onnx_path', default=None, help='path to save onnx model')
 
     args, unparsed = parser.parse_known_args()
+    if args.nodist:
+        args.eval = True
 
     config = get_config(args)
 
@@ -226,7 +231,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
 
 @torch.no_grad()
-def validate(config, data_loader, model):
+def validate(config, data_loader, model, dist=True):
     criterion = torch.nn.CrossEntropyLoss()
     model.eval()
 
@@ -247,10 +252,10 @@ def validate(config, data_loader, model):
         # measure accuracy and record loss
         loss = criterion(output, target)
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-
-        acc1 = reduce_tensor(acc1)
-        acc5 = reduce_tensor(acc5)
-        loss = reduce_tensor(loss)
+        if dist:
+           acc1 = reduce_tensor(acc1)
+           acc5 = reduce_tensor(acc5)
+           loss = reduce_tensor(loss)
 
         loss_meter.update(loss.item(), target.size(0))
         acc1_meter.update(acc1.item(), target.size(0))
@@ -292,9 +297,34 @@ def throughput(data_loader, model, logger):
         logger.info(f"batch_size {batch_size} throughput {30 * batch_size / (tic2 - tic1)}")
         return
 
+def inference(config):
+    data_loader_val = build_loader_val(config)
+    os.makedirs(config.OUTPUT, exist_ok=True)
+    logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
+    model = build_model(config)
+    model.cuda()
+    load_pretrained(config, model, logger)
+    logger.info(str(model))
+    acc1, acc5, loss = validate(config, data_loader_val, model, dist=False)
+
+def convert_onnx(onnx_path, img_size):
+    model = build_model(config)
+    model.cuda()
+    load_pretrained(config, model, logger)
+    x = torch.randn(1, 3, img_size, img_size, requires_grad=False)
+    torch.onnx.export(model.to("cpu"), x.to("cpu"), onnx_path, opset_version=11)
 
 if __name__ == '__main__':
     args, config = parse_option()
+    logger = create_logger(output_dir=config.OUTPUT, name=f"{config.MODEL.NAME}")
+    if args.nodist:
+        inference(config)
+        if  args.save_onnx_path is None:
+           exit(-1)
+
+    if args.save_onnx_path:
+        convert_onnx(args.save_onnx_path, img_size=config.DATA.IMG_SIZE)
+        exit(-1)
 
     if config.AMP_OPT_LEVEL:
         print("[warning] Apex amp has been deprecated, please use pytorch amp instead!")
@@ -307,7 +337,7 @@ if __name__ == '__main__':
         rank = -1
         world_size = -1
     torch.cuda.set_device(config.LOCAL_RANK)
-    torch.distributed.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    torch.distributed.init_process_group(backend='gloo' if platform.system() == "Windows" else "nccl", init_method='env://', world_size=world_size, rank=rank)
     torch.distributed.barrier()
 
     seed = config.SEED + dist.get_rank()
