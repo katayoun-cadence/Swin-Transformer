@@ -52,9 +52,11 @@ def window_partition(x, window_size):
         windows: (num_windows*B, window_size, window_size, C)
     """
     B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    return windows
+    x_slices = [x[:,i*window_size:(i+1)*window_size,:,:] for i in range(H // window_size)]
+    windows = torch.cat(x_slices, axis =2)
+    windows = windows.reshape(B, window_size, H // window_size * W // window_size, window_size * C)
+    windows = windows.permute(0,2,1,3).reshape(-1,window_size, window_size, C)
+    return windows.contiguous()
 
 
 def window_reverse(windows, window_size, H, W):
@@ -68,9 +70,12 @@ def window_reverse(windows, window_size, H, W):
     Returns:
         x: (B, H, W, C)
     """
+    C = int(windows.shape[3])
     B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    num_windows = int(windows.shape[0] / B)
+    windows = windows.reshape(B, num_windows, window_size, window_size * C).permute(0,2,1,3).reshape(B, window_size, num_windows * window_size, C)
+    window_slices = [windows[:,:,i*W:(i+1)*W,:] for i in range(H // window_size)]
+    x = torch.cat(window_slices, axis=1)
     return x
 
 
@@ -129,8 +134,10 @@ class WindowAttention(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        qkv = self.qkv(x).reshape(B_, N, 3 * self.num_heads, C // self.num_heads)
+        q = qkv[:,:,0*self.num_heads:1*self.num_heads,:].permute(0,2,1,3)
+        k = qkv[:,:,1*self.num_heads:2*self.num_heads,:].permute(0,2,1,3)
+        v = qkv[:,:,2*self.num_heads:3*self.num_heads,:].permute(0,2,1,3)
 
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
@@ -142,7 +149,8 @@ class WindowAttention(nn.Module):
 
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1)
+            attn = attn.view(B_//nW, nW*self.num_heads, N, N) + mask.view(1, nW*self.num_heads, N, N)
             attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
@@ -563,7 +571,7 @@ class SwinTransformer(nn.Module):
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
-        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.avgpool = nn.AdaptiveAvgPool2d((1,1))
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
         self.apply(self._init_weights)
@@ -595,7 +603,12 @@ class SwinTransformer(nn.Module):
             x = layer(x)
 
         x = self.norm(x)  # B L C
-        x = self.avgpool(x.transpose(1, 2))  # B C 1
+        B, L, C = x.shape
+        import math
+        factor = int(math.sqrt(L))
+        while L % factor != 0:
+          factor = factor - 1
+        x = self.avgpool(x.transpose(1, 2).reshape(B, C, factor, int(L / factor)))  # B C 1 1
         x = torch.flatten(x, 1)
         return x
 
